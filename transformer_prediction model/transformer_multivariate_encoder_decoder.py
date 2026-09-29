@@ -1,0 +1,1065 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+import matplotlib.pyplot as plt
+
+
+# ============================================================
+# 1. 固定随机种子
+# ============================================================
+
+torch.manual_seed(42)
+np.random.seed(42)
+
+
+# ============================================================
+# 2. 设置实验参数
+# ============================================================
+
+# 输入序列长度：使用过去20个时间点
+input_len = 20
+
+# 输出序列长度：预测未来50个时间点
+output_len = 50
+
+# 输入变量数量
+input_size = 5
+
+# Transformer隐藏维度
+d_model = 64
+
+# Multi-Head Attention头数
+nhead = 4
+
+# Encoder层数
+num_encoder_layers = 2
+
+# Decoder层数
+num_decoder_layers = 2
+
+# 前馈神经网络隐藏层维度
+dim_feedforward = 128
+
+# Dropout
+dropout = 0.1
+
+# 训练轮数
+epochs = 300
+
+# 学习率
+lr = 0.001
+
+# Batch Size
+batch_size = 32
+
+
+# ============================================================
+# 3. 构造多变量时间序列数据
+# ============================================================
+
+# 时间轴
+t = torch.linspace(0, 100, 1000)
+
+
+# ---------- 5个输入变量 ----------
+
+x1 = torch.sin(t)
+
+x2 = torch.cos(t)
+
+x3 = torch.sin(2 * t)
+
+x4 = torch.cos(2 * t)
+
+x5 = 0.1 * t
+
+# ============================================================
+# 4. 构造目标变量
+# ============================================================
+
+# 目标变量是5个输入变量的组合
+#
+# 这样做的目的：
+# 我们人为规定真实规律，
+# 让模型学习：
+#
+# x1、x2、x3、x4、x5
+#        ↓
+#       y
+#
+# 这相当于一个简单的多变量时间序列预测问题。
+
+y = (
+    0.5 * x1
+    + 0.3 * x2
+    + 0.15 * x3
+    + 0.1 * x4
+    + 0.1 * x5
+)
+
+
+# ============================================================
+# 5. 将5个输入变量组合起来
+# ============================================================
+
+# X_raw：
+#
+# 每一行 = 一个时间点
+# 每一列 = 一个变量
+#
+# shape：
+# [1000, 5]
+
+X_raw = torch.stack(
+    [x1, x2, x3, x4, x5],
+    dim=1
+)
+
+# y：
+#
+# [1000]
+#
+# 为了后面统一处理，
+# 增加最后一个维度：
+#
+# [1000, 1]
+
+Y_raw = y.unsqueeze(1)
+
+
+print("X_raw shape:", X_raw.shape)
+print("Y_raw shape:", Y_raw.shape)
+
+
+# ============================================================
+# 6. 划分训练集和测试集
+# ============================================================
+
+# 前800个时间点用于训练
+train_size = 800
+
+X_train_raw = X_raw[:train_size]
+
+Y_train_raw = Y_raw[:train_size]
+
+
+# 后200个时间点用于测试
+X_test_raw = X_raw[train_size:]
+
+Y_test_raw = Y_raw[train_size:]
+
+
+print("\n训练集：")
+print("X_train_raw:", X_train_raw.shape)
+print("Y_train_raw:", Y_train_raw.shape)
+
+print("\n测试集：")
+print("X_test_raw:", X_test_raw.shape)
+print("Y_test_raw:", Y_test_raw.shape)
+
+
+# ============================================================
+# 7. 标准化
+# ============================================================
+
+# Transformer训练时，
+# 不同变量的数值范围如果差别太大，
+# 会影响训练。
+#
+# 所以对输入变量进行标准化：
+#
+# x_norm = (x - mean) / std
+
+
+X_mean = X_train_raw.mean(dim=0)
+
+X_std = X_train_raw.std(dim=0)
+
+
+X_train_norm = (
+    X_train_raw - X_mean
+) / X_std
+
+
+X_test_norm = (
+    X_test_raw - X_mean
+) / X_std
+
+
+# 目标变量也进行标准化
+
+Y_mean = Y_train_raw.mean(dim=0)
+
+Y_std = Y_train_raw.std(dim=0)
+
+
+Y_train_norm = (
+    Y_train_raw - Y_mean
+) / Y_std
+
+
+Y_test_norm = (
+    Y_test_raw - Y_mean
+) / Y_std
+
+
+print("\nX_mean:")
+print(X_mean)
+
+print("\nX_std:")
+print(X_std)
+
+print("\nY_mean:")
+print(Y_mean)
+
+print("\nY_std:")
+print(Y_std)
+
+
+# ============================================================
+# 8. 构造滑动窗口
+# ============================================================
+
+def create_sequences(
+        X,
+        Y,
+        input_len,
+        output_len
+):
+    """
+    构造：
+
+    过去 input_len 个时间点
+        →
+    未来 output_len 个时间点
+
+    X:
+        [总时间点, 特征数]
+
+    Y:
+        [总时间点, 1]
+    """
+
+    X_sequences = []
+
+    Y_sequences = []
+
+    total_len = len(X)
+
+    for i in range(
+        total_len - input_len - output_len + 1
+    ):
+
+        # -----------------------------
+        # Encoder输入
+        # -----------------------------
+
+        X_seq = X[
+            i:i + input_len
+        ]
+
+        # -----------------------------
+        # Decoder目标
+        # -----------------------------
+
+        Y_seq = Y[
+            i + input_len:
+            i + input_len + output_len
+        ]
+
+        X_sequences.append(X_seq)
+
+        Y_sequences.append(Y_seq)
+
+    return (
+        torch.stack(X_sequences),
+        torch.stack(Y_sequences)
+    )
+
+
+# ============================================================
+# 9. 创建训练数据
+# ============================================================
+
+X_train, Y_train = create_sequences(
+    X_train_norm,
+    Y_train_norm,
+    input_len,
+    output_len
+)
+
+
+# ============================================================
+# 10. 创建测试数据
+# ============================================================
+
+X_test, Y_test = create_sequences(
+    X_test_norm,
+    Y_test_norm,
+    input_len,
+    output_len
+)
+
+
+print("\n滑动窗口之后：")
+
+print("X_train shape:", X_train.shape)
+
+print("Y_train shape:", Y_train.shape)
+
+print("X_test shape:", X_test.shape)
+
+print("Y_test shape:", Y_test.shape)
+
+
+# ============================================================
+# 11. DataLoader
+# ============================================================
+
+train_dataset = torch.utils.data.TensorDataset(
+    X_train,
+    Y_train
+)
+
+
+train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=batch_size,
+    shuffle=True
+)
+
+
+# ============================================================
+# 12. Positional Encoding
+# ============================================================
+
+class PositionalEncoding(nn.Module):
+
+    def __init__(
+        self,
+        d_model,
+        max_len=500
+    ):
+
+        super().__init__()
+
+        # 创建位置矩阵
+        position = torch.arange(
+            max_len
+        ).unsqueeze(1).float()
+
+        # 计算频率
+        div_term = torch.exp(
+            torch.arange(
+                0,
+                d_model,
+                2
+            ).float()
+            * (-np.log(10000.0) / d_model)
+        )
+
+        pe = torch.zeros(
+            max_len,
+            d_model
+        )
+
+        # 偶数维度
+        pe[:, 0::2] = torch.sin(
+            position * div_term
+        )
+
+        # 奇数维度
+        pe[:, 1::2] = torch.cos(
+            position * div_term
+        )
+
+        # [1, max_len, d_model]
+        pe = pe.unsqueeze(0)
+
+        self.register_buffer(
+            "pe",
+            pe
+        )
+
+    def forward(self, x):
+
+        # x:
+        # [batch, seq_len, d_model]
+
+        return x + self.pe[
+            :, :x.size(1), :
+        ]
+
+
+# ============================================================
+# 13. Transformer Encoder-Decoder模型
+# ============================================================
+
+class TransformerForecast(
+    nn.Module
+):
+
+    def __init__(
+        self,
+        input_size,
+        d_model,
+        nhead,
+        num_encoder_layers,
+        num_decoder_layers,
+        dim_feedforward,
+        dropout
+    ):
+
+        super().__init__()
+
+
+        # ====================================================
+        # 13.1 输入投影
+        # ====================================================
+
+        # 5个变量
+        #
+        # ↓
+        #
+        # 64维Embedding
+        #
+        # [batch, seq, 5]
+        #
+        # ↓
+        #
+        # [batch, seq, 64]
+
+        self.input_projection = nn.Linear(
+            input_size,
+            d_model
+        )
+
+
+        # ====================================================
+        # 13.2 Encoder
+        # ====================================================
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+
+
+        self.encoder = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=num_encoder_layers
+        )
+
+
+        # ====================================================
+        # 13.3 Decoder
+        # ====================================================
+
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+
+
+        self.decoder = nn.TransformerDecoder(
+            decoder_layer,
+            num_layers=num_decoder_layers
+        )
+
+
+        # ====================================================
+        # 13.4 位置编码
+        # ====================================================
+
+        self.pos_encoder = PositionalEncoding(
+            d_model
+        )
+
+        self.pos_decoder = PositionalEncoding(
+            d_model
+        )
+
+
+        # ====================================================
+        # 13.5 Decoder输入投影
+        # ====================================================
+
+        # Decoder每个时间点只有一个目标变量
+        #
+        # [batch, seq, 1]
+        #
+        # ↓
+        #
+        # [batch, seq, 64]
+
+        self.target_projection = nn.Linear(
+            1,
+            d_model
+        )
+
+
+        # ====================================================
+        # 13.6 输出层
+        # ====================================================
+
+        # 64维
+        #
+        # ↓
+        #
+        # 1维目标变量
+
+        self.output_projection = nn.Linear(
+            d_model,
+            1
+        )
+
+
+    def forward(
+        self,
+        src,
+        tgt
+    ):
+
+        # ====================================================
+        # src
+        #
+        # [batch, 20, 5]
+        #
+        # tgt
+        #
+        # [batch, 50, 1]
+        # ====================================================
+
+
+        # ====================================================
+        # Step 1：Encoder输入投影
+        # ====================================================
+
+        src = self.input_projection(src)
+
+        # [batch, 20, 5]
+        #
+        # →
+        #
+        # [batch, 20, 64]
+
+
+        # ====================================================
+        # Step 2：加入位置编码
+        # ====================================================
+
+        src = self.pos_encoder(src)
+
+
+        # ====================================================
+        # Step 3：Encoder
+        # ====================================================
+
+        memory = self.encoder(src)
+
+        # memory：
+        #
+        # [batch, 20, 64]
+
+
+        # ====================================================
+        # Step 4：Decoder输入投影
+        # ====================================================
+
+        tgt = self.target_projection(tgt)
+
+        # [batch, 50, 1]
+        #
+        # →
+        #
+        # [batch, 50, 64]
+
+
+        # ====================================================
+        # Step 5：Decoder位置编码
+        # ====================================================
+
+        tgt = self.pos_decoder(tgt)
+
+
+        # ====================================================
+        # Step 6：生成Decoder Mask
+        # ====================================================
+
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(
+            tgt.size(1)
+        ).to(tgt.device)
+
+
+        # ====================================================
+        # Step 7：Decoder
+        # ====================================================
+
+        output = self.decoder(
+            tgt,
+            memory,
+            tgt_mask=tgt_mask
+        )
+
+        # [batch, 50, 64]
+
+
+        # ====================================================
+        # Step 8：输出预测值
+        # ====================================================
+
+        output = self.output_projection(
+            output
+        )
+
+        # [batch, 50, 1]
+
+        return output
+
+
+# ============================================================
+# 14. 创建模型
+# ============================================================
+
+model = TransformerForecast(
+    input_size=input_size,
+    d_model=d_model,
+    nhead=nhead,
+    num_encoder_layers=num_encoder_layers,
+    num_decoder_layers=num_decoder_layers,
+    dim_feedforward=dim_feedforward,
+    dropout=dropout
+)
+
+
+print("\n模型结构：")
+print(model)
+
+
+# ============================================================
+# 15. 损失函数和优化器
+# ============================================================
+
+criterion = nn.MSELoss()
+
+optimizer = optim.Adam(
+    model.parameters(),
+    lr=lr
+)
+
+
+# ============================================================
+# 16. Decoder输入构造
+# ============================================================
+
+def create_decoder_input(
+    target
+):
+    """
+    Teacher Forcing：
+
+    Decoder不能直接看到完整答案。
+
+    例如真实序列：
+
+    y1 y2 y3 y4 y5
+
+    Decoder输入：
+
+    0  y1 y2 y3 y4
+
+    Decoder预测：
+
+    y1 y2 y3 y4 y5
+    """
+
+    decoder_input = torch.zeros_like(
+        target
+    )
+
+    decoder_input[:, 1:, :] = target[
+        :, :-1, :
+    ]
+
+    return decoder_input
+
+
+# ============================================================
+# 17. 开始训练
+# ============================================================
+
+loss_history = []
+
+
+for epoch in range(epochs):
+
+    model.train()
+
+    total_loss = 0.0
+
+
+    for X_batch, Y_batch in train_loader:
+
+        # -----------------------------------------------
+        # 构造Decoder输入
+        # -----------------------------------------------
+
+        decoder_input = create_decoder_input(
+            Y_batch
+        )
+
+
+        # -----------------------------------------------
+        # 前向传播
+        # -----------------------------------------------
+
+        prediction = model(
+            X_batch,
+            decoder_input
+        )
+
+
+        # -----------------------------------------------
+        # 计算Loss
+        # -----------------------------------------------
+
+        loss = criterion(
+            prediction,
+            Y_batch
+        )
+
+
+        # -----------------------------------------------
+        # 梯度清零
+        # -----------------------------------------------
+
+        optimizer.zero_grad()
+
+
+        # -----------------------------------------------
+        # 反向传播
+        # -----------------------------------------------
+
+        loss.backward()
+
+
+        # -----------------------------------------------
+        # 更新参数
+        # -----------------------------------------------
+
+        optimizer.step()
+
+
+        total_loss += loss.item()
+
+
+    average_loss = (
+        total_loss
+        / len(train_loader)
+    )
+
+
+    loss_history.append(
+        average_loss
+    )
+
+
+    if (epoch + 1) % 20 == 0:
+
+        print(
+            f"Epoch [{epoch + 1}/{epochs}] "
+            f"Loss: {average_loss:.6f}"
+        )
+
+
+# ============================================================
+# 18. 绘制Loss曲线
+# ============================================================
+
+plt.figure(
+    figsize=(10, 5)
+)
+
+plt.plot(
+    loss_history
+)
+
+plt.xlabel("Epoch")
+
+plt.ylabel("MSE Loss")
+
+plt.title(
+    "Transformer Encoder-Decoder Training Loss"
+)
+
+plt.grid()
+
+plt.show()
+
+
+# ============================================================
+# 19. 自回归预测
+# ============================================================
+
+model.eval()
+
+
+with torch.no_grad():
+
+    # --------------------------------------------------------
+    # 取一个测试样本
+    # --------------------------------------------------------
+
+    x_sample = X_test[0:1]
+
+    # x_sample:
+    #
+    # [1, 20, 5]
+
+
+    # --------------------------------------------------------
+    # Encoder先处理整个历史序列
+    # --------------------------------------------------------
+
+    src = model.input_projection(
+        x_sample
+    )
+
+    # [1, 20, 5]
+    #
+    # ↓
+    #
+    # [1, 20, 64]
+
+
+    src = model.pos_encoder(src)
+
+
+    # Encoder输出
+    memory = model.encoder(src)
+
+    # memory:
+    #
+    # [1, 20, 64]
+
+
+    # --------------------------------------------------------
+    # Decoder从一个起始值开始
+    # --------------------------------------------------------
+
+    decoder_input = torch.zeros(
+        1,
+        1,
+        1
+    )
+
+    # 当前：
+    #
+    # [0]
+
+
+    predictions = []
+
+
+    # ========================================================
+    # 自回归生成未来50个点
+    # ========================================================
+
+    for step in range(output_len):
+
+
+        # --------------------------------------------
+        # Decoder输入投影
+        # --------------------------------------------
+
+        tgt = model.target_projection(
+            decoder_input
+        )
+
+
+        # --------------------------------------------
+        # 位置编码
+        # --------------------------------------------
+
+        tgt = model.pos_decoder(tgt)
+
+
+        # --------------------------------------------
+        # 创建Causal Mask
+        # --------------------------------------------
+
+        tgt_mask = (
+            nn.Transformer
+            .generate_square_subsequent_mask(
+                tgt.size(1)
+            )
+        )
+
+
+        # --------------------------------------------
+        # Decoder
+        # --------------------------------------------
+
+        output = model.decoder(
+            tgt,
+            memory,
+            tgt_mask=tgt_mask
+        )
+
+
+        # --------------------------------------------
+        # 取最后一个时间步
+        # --------------------------------------------
+
+        next_value = model.output_projection(
+            output[:, -1:, :]
+        )
+
+        # next_value:
+        #
+        # [1, 1, 1]
+
+
+        # --------------------------------------------
+        # 保存预测值
+        # --------------------------------------------
+
+        predictions.append(
+            next_value
+        )
+
+
+        # --------------------------------------------
+        # 将预测结果加入Decoder输入
+        # --------------------------------------------
+
+        decoder_input = torch.cat(
+            [
+                decoder_input,
+                next_value
+            ],
+            dim=1
+        )
+
+
+    # ========================================================
+    # 拼接50个预测值
+    # ========================================================
+
+    prediction = torch.cat(
+        predictions,
+        dim=1
+    )
+
+    # prediction：
+    #
+    # [1, 50, 1]
+
+# ============================================================
+# 20. 反标准化
+# ============================================================
+
+prediction_original = (
+    prediction
+    * Y_std
+    + Y_mean
+)
+
+
+true_original = (
+    Y_test[0:1]
+    * Y_std
+    + Y_mean
+)
+
+
+# ============================================================
+# 21. 计算误差
+# ============================================================
+
+mse = torch.mean(
+    (
+        prediction_original
+        - true_original
+    ) ** 2
+)
+
+
+rmse = torch.sqrt(
+    mse
+)
+
+
+mae = torch.mean(
+    torch.abs(
+        prediction_original
+        - true_original
+    )
+)
+
+
+print("\n==============================")
+print("测试结果")
+print("==============================")
+
+print(
+    "MSE:",
+    mse.item()
+)
+
+print(
+    "RMSE:",
+    rmse.item()
+)
+
+print(
+    "MAE:",
+    mae.item()
+)
+
+
+# ============================================================
+# 22. 绘制预测结果
+# ============================================================
+
+plt.figure(
+    figsize=(12, 5)
+)
+
+
+plt.plot(
+    true_original.squeeze().numpy(),
+    label="True"
+)
+
+
+plt.plot(
+    prediction_original.squeeze().numpy(),
+    label="Prediction"
+)
+
+
+plt.xlabel(
+    "Future Time Step"
+)
+
+plt.ylabel(
+    "Target Value"
+)
+
+plt.title(
+    "20 → 50 Multivariate Transformer Forecast"
+)
+
+plt.legend()
+
+plt.grid()
+
+plt.show()
